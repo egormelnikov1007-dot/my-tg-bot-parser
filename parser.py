@@ -221,47 +221,104 @@ def monitor_market() -> None:
         time.sleep(POLL_SECONDS)
 
 
+def same_text(left: Any, right: Any) -> bool:
+    return str(left or "").strip().lower() == str(right or "").strip().lower()
+
+
+def has_real_traits(item: dict[str, Any]) -> bool:
+    return item.get("model") not in ("", "No Model", None) and item.get("backdrop") not in ("", "No Backdrop", None)
+
+
 def exact_match(item: dict[str, Any], name: str, model: str, backdrop: str) -> bool:
     return (
-        item.get("name") == name
-        and item.get("model") == model
-        and item.get("backdrop") == backdrop
+        same_text(item.get("name"), name)
+        and same_text(item.get("model"), model)
+        and same_text(item.get("backdrop"), backdrop)
     )
 
 
-def fetch_sales(name: str, model: str, backdrop: str, limit: int = 10) -> list[dict[str, Any]]:
-    sales: list[dict[str, Any]] = []
+def name_match(item: dict[str, Any], name: str) -> bool:
+    return same_text(item.get("name"), name)
+
+
+def fetch_sales_candidates(limit: int = 10) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
+    attempts = [
+        {"status": "sold", "sort": "-sold_at"},
+        {"status": "sold", "sort": "-updated_at"},
+        {"status": "completed", "sort": "-sold_at"},
+        {"status": "closed", "sort": "-updated_at"},
+    ]
 
-    for offset in range(0, 100, 50):
-        try:
-            raw_items = fetch_portal_items(limit=50, status="sold", sort="-sold_at", offset=offset, timeout=8)
-        except Exception as exc:
-            print(f"Sales fetch failed: {exc}")
-            break
+    for attempt in attempts:
+        for offset in range(0, 150, 50):
+            try:
+                raw_items = fetch_portal_items(
+                    limit=50,
+                    status=attempt["status"],
+                    sort=attempt["sort"],
+                    offset=offset,
+                    timeout=8,
+                )
+            except Exception as exc:
+                print(f"Sales fetch failed {attempt}: {exc}")
+                break
 
-        if not raw_items:
-            break
+            if not raw_items:
+                break
 
-        for raw in raw_items:
-            item = normalize_item(raw)
-            if item["id"] in seen_ids:
-                continue
-            if exact_match(item, name, model, backdrop):
-                seen_ids.add(item["id"])
-                sales.append(item)
-                if len(sales) >= limit:
-                    return sales
+            for raw in raw_items:
+                item = normalize_item(raw)
+                item_id = item["id"] or f"{item['name']}:{item['price']}:{item.get('sold_at') or item.get('listed_at')}"
+                if item_id in seen_ids:
+                    continue
+                seen_ids.add(item_id)
+                candidates.append(item)
 
-    return sales
+            if len(candidates) >= limit * 20:
+                return candidates
+
+    return candidates
 
 
-def format_analysis_message(name: str, model: str, backdrop: str, sales: list[dict[str, Any]]) -> str:
+def fetch_sales(name: str, model: str, backdrop: str, limit: int = 10) -> tuple[list[dict[str, Any]], str]:
+    candidates = fetch_sales_candidates(limit=limit)
+    exact_sales = [item for item in candidates if exact_match(item, name, model, backdrop)]
+    if exact_sales:
+        return exact_sales[:limit], "exact"
+
+    # Some Portal/market endpoints do not expose model/backdrop for historical activity.
+    # In that case we return name-only sales and mark them clearly in the message.
+    name_sales = [item for item in candidates if name_match(item, name)]
+    no_trait_sales = [item for item in name_sales if not has_real_traits(item)]
+    if no_trait_sales:
+        return no_trait_sales[:limit], "name_only"
+    if name_sales:
+        return name_sales[:limit], "name_only"
+
+    return [], "none"
+
+
+def format_analysis_message(name: str, model: str, backdrop: str, sales: list[dict[str, Any]], mode: str) -> str:
     title = f"Анализ: {name}\nМодель: {model}\nФон: {backdrop}"
     if not sales:
-        return f"{title}\n\nПоследние продажи не найдены."
+        return (
+            f"{title}\n\n"
+            "Последние продажи через API не найдены.\n"
+            "В Portals они могут быть в Activity, но публичный ответ не отдал их в нужном формате."
+        )
 
-    lines = [title, "", f"Последние {len(sales)} продаж:"]
+    if mode == "exact":
+        lines = [title, "", f"Последние {len(sales)} продаж именно этой модели и фона:"]
+    else:
+        lines = [
+            title,
+            "",
+            f"Нашёл {len(sales)} продаж по названию подарка.",
+            "Важно: API не отдал модель/фон для истории, поэтому это не 100% точный анализ по фону.",
+        ]
+
     for index, sale in enumerate(sales, start=1):
         when = sale.get("sold_at") or sale.get("listed_at") or "время неизвестно"
         lines.append(f"{index}. {sale['price']} TON | {when}")
@@ -356,8 +413,8 @@ def analyze_gift(payload: dict[str, Any]) -> dict[str, Any]:
     limit = int(payload.get("limit") or 10)
     limit = max(1, min(limit, 50))
 
-    sales = fetch_sales(name, model, backdrop, limit=limit)
-    message = format_analysis_message(name, model, backdrop, sales)
+    sales, mode = fetch_sales(name, model, backdrop, limit=limit)
+    message = format_analysis_message(name, model, backdrop, sales, mode)
     sent_to_bot = send_bot_message(message)
 
     return {
@@ -366,6 +423,7 @@ def analyze_gift(payload: dict[str, Any]) -> dict[str, Any]:
         "model": model,
         "backdrop": backdrop,
         "sales": sales,
+        "mode": mode,
         "message": message,
         "sent_to_bot": sent_to_bot,
     }
@@ -376,6 +434,7 @@ if __name__ == "__main__":
 
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 
 
