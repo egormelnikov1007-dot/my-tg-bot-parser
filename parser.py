@@ -382,32 +382,33 @@ def debug_auth_check() -> dict[str, Any]:
 
 @app.get("/api/debug/probe")
 def debug_probe() -> dict[str, Any]:
-    """Пробует разные комбинации параметров к Portal API и показывает, что принимается."""
+    """Пробует разные эндпоинты/параметры Portal API, чтобы найти рабочий путь для истории продаж."""
     if not PORTAL_AUTH:
         return {"ok": False, "error": "PORTAL_AUTH не задан"}
 
+    base = "https://portal-market.com/api"
     attempts = [
-        {"status": "listed", "sort": "-listed_at", "limit": 2, "offset": 0},
-        {"status": "sold", "sort": "-sold_at", "limit": 2, "offset": 0},
-        {"status": "sold", "sort": "latest", "limit": 2, "offset": 0},
-        {"sort": "latest", "activityType": "sale", "limit": 2, "offset": 0},
-        {"sort": "latest", "limit": 2, "offset": 0},
-        {"sort": "price_desc", "limit": 2, "offset": 0},
+        {"url": f"{base}/nfts/search", "params": {"status": "listed", "sort": "-listed_at", "limit": 2, "offset": 0}},
+        {"url": f"{base}/market/activity", "params": {"sort": "latest", "activityType": "buy", "limit": 3, "offset": 0}},
+        {"url": f"{base}/market-activity", "params": {"sort": "latest", "activityType": "buy", "limit": 3, "offset": 0}},
+        {"url": f"{base}/activity", "params": {"sort": "latest", "activityType": "buy", "limit": 3, "offset": 0}},
+        {"url": f"{base}/marketActivity", "params": {"sort": "latest", "activityType": "buy", "limit": 3, "offset": 0}},
+        {"url": f"{base}/nfts/activity", "params": {"sort": "latest", "activityType": "buy", "limit": 3, "offset": 0}},
     ]
 
     results = []
-    for params in attempts:
-        entry: dict[str, Any] = {"params": params}
+    for attempt in attempts:
+        entry: dict[str, Any] = {"url": attempt["url"], "params": attempt["params"]}
         try:
-            url = f"{PORTAL_API_URL}?{urllib.parse.urlencode(params)}"
+            url = f"{attempt['url']}?{urllib.parse.urlencode(attempt['params'])}"
             headers = {"User-Agent": "PortalGiftScanner/1.0", "Authorization": PORTAL_AUTH}
             request = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(request, timeout=10) as response:
                 body = json.loads(response.read().decode("utf-8"))
-                results_list = body.get("results") or body.get("nfts") or []
+                results_list = body if isinstance(body, list) else (body.get("results") or body.get("activities") or [])
                 entry["ok"] = True
                 entry["count"] = len(results_list) if isinstance(results_list, list) else None
-                entry["top_level_keys"] = list(body.keys())
+                entry["top_level_keys"] = list(body.keys()) if isinstance(body, dict) else "list"
                 entry["sample"] = results_list[:1] if isinstance(results_list, list) else body
         except urllib.error.HTTPError as exc:
             entry["ok"] = False
@@ -420,6 +421,7 @@ def debug_probe() -> dict[str, Any]:
             entry["ok"] = False
             entry["error"] = str(exc)
         results.append(entry)
+        time.sleep(1.5)  # уважаем rate limit Portal API (429 при частых запросах)
 
     return {"ok": True, "attempts": results}
 
