@@ -18,6 +18,7 @@ FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "100"))
 DEFAULT_WINDOW_MINUTES = int(os.getenv("WINDOW_MINUTES", "5"))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 BOT_CHAT_ID = os.getenv("BOT_CHAT_ID", "").strip()
+PORTAL_AUTH = os.getenv("PORTAL_AUTH", "").strip()
 FRONTEND_ORIGINS = [
     origin.strip()
     for origin in os.getenv("FRONTEND_ORIGINS", "*").split(",")
@@ -134,7 +135,11 @@ def normalize_item(item: dict[str, Any]) -> dict[str, Any]:
 
 def portal_request(params: dict[str, Any], timeout: int = 20) -> dict[str, Any]:
     url = f"{PORTAL_API_URL}?{urllib.parse.urlencode(params)}"
-    request = urllib.request.Request(url, headers={"User-Agent": "PortalGiftScanner/1.0"})
+    headers = {"User-Agent": "PortalGiftScanner/1.0"}
+    if PORTAL_AUTH:
+        # PORTAL_AUTH должен содержать значение целиком, начиная с "tma "
+        headers["Authorization"] = PORTAL_AUTH
+    request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
@@ -356,6 +361,24 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/debug/auth-check")
+def debug_auth_check() -> dict[str, Any]:
+    """Проверка: реально ли PORTAL_AUTH принимается Portal API для status=sold."""
+    if not PORTAL_AUTH:
+        return {"ok": False, "error": "PORTAL_AUTH не задан в переменных окружения"}
+    try:
+        raw_items = fetch_portal_items(limit=5, status="sold", sort="-sold_at", offset=0, timeout=10)
+        return {
+            "ok": True,
+            "auth_present": True,
+            "auth_prefix": PORTAL_AUTH[:10] + "...",
+            "items_returned": len(raw_items),
+            "sample": raw_items[:1],
+        }
+    except Exception as exc:
+        return {"ok": False, "auth_present": True, "error": str(exc)}
+
+
 @app.post("/api/refresh")
 def manual_refresh() -> dict[str, Any]:
     return {"ok": True, "count": refresh_market()}
@@ -434,7 +457,3 @@ if __name__ == "__main__":
 
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
-
-
-
