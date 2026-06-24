@@ -3,18 +3,21 @@ import os
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone
-from typing import Any
-
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 DB_PATH = os.getenv("DB_PATH", "portal_market.db")
 PORTAL_API_URL = "https://portal-market.com/api/nfts/search"
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "20"))
 FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "100"))
+DEFAULT_WINDOW_MINUTES = int(os.getenv("WINDOW_MINUTES", "5"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_CHAT_ID = os.getenv("BOT_CHAT_ID", "").strip()
 FRONTEND_ORIGINS = [
     origin.strip()
     for origin in os.getenv("FRONTEND_ORIGINS", "*").split(",")
@@ -31,10 +34,43 @@ app.add_middleware(
 )
 
 
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def parse_dt(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, (int, float)):
+        raw = float(value)
+        if raw > 10_000_000_000:
+            raw = raw / 1000
+        return datetime.fromtimestamp(raw, timezone.utc)
+
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
 def db_connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 def init_db() -> None:
@@ -56,8 +92,10 @@ def init_db() -> None:
             )
             """
         )
+        ensure_column(conn, "items_v3", "first_seen_at", "TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_items_v3_price ON items_v3(price)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_items_v3_seen_at ON items_v3(seen_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_items_v3_first_seen_at ON items_v3(first_seen_at)")
 
 
 def get_attr(item: dict[str, Any], names: set[str], default: str = "") -> str:
@@ -77,6 +115,8 @@ def as_float(value: Any, default: float = 0.0) -> float:
 
 def normalize_item(item: dict[str, Any]) -> dict[str, Any]:
     item_id = str(item.get("id") or item.get("nft_id") or item.get("slug") or "")
+    listed_at = item.get("listed_at") or item.get("created_at") or item.get("updated_at") or ""
+    sold_at = item.get("sold_at") or item.get("closed_at") or item.get("updated_at") or ""
     return {
         "id": item_id,
         "name": str(item.get("name") or "Unknown Gift"),
@@ -86,31 +126,32 @@ def normalize_item(item: dict[str, Any]) -> dict[str, Any]:
         "model": get_attr(item, {"model"}, "No Model"),
         "backdrop": get_attr(item, {"backdrop", "background"}, "No Backdrop"),
         "status": item.get("status") or "listed",
-        "listed_at": item.get("listed_at") or item.get("created_at") or "",
+        "listed_at": listed_at or sold_at,
+        "sold_at": sold_at,
         "raw_json": json.dumps(item, ensure_ascii=False),
     }
 
 
-def fetch_portal_items(limit: int = FETCH_LIMIT) -> list[dict[str, Any]]:
-    params = urllib.parse.urlencode(
-        {
-            "offset": 0,
-            "limit": limit,
-            "status": "listed",
-            "sort": "-listed_at",
-        }
-    )
-    url = f"{PORTAL_API_URL}?{params}"
+def portal_request(params: dict[str, Any], timeout: int = 20) -> dict[str, Any]:
+    url = f"{PORTAL_API_URL}?{urllib.parse.urlencode(params)}"
     request = urllib.request.Request(url, headers={"User-Agent": "PortalGiftScanner/1.0"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
 
-    with urllib.request.urlopen(request, timeout=20) as response:
-        payload = json.loads(response.read().decode("utf-8"))
 
+def fetch_portal_items(
+    limit: int = FETCH_LIMIT,
+    status: str = "listed",
+    sort: str = "-listed_at",
+    offset: int = 0,
+    timeout: int = 20,
+) -> list[dict[str, Any]]:
+    payload = portal_request({"offset": offset, "limit": limit, "status": status, "sort": sort}, timeout=timeout)
     return payload.get("results") or []
 
 
 def save_items(items: list[dict[str, Any]]) -> int:
-    now = datetime.now(timezone.utc).isoformat()
+    seen_at = now_utc().isoformat()
     normalized = [normalize_item(item) for item in items]
     normalized = [item for item in normalized if item["id"]]
 
@@ -119,8 +160,8 @@ def save_items(items: list[dict[str, Any]]) -> int:
             """
             INSERT INTO items_v3 (
                 id, name, price, tg_id, photo_url, model, backdrop,
-                status, listed_at, seen_at, raw_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                status, listed_at, seen_at, first_seen_at, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name,
                 price=excluded.price,
@@ -144,7 +185,8 @@ def save_items(items: list[dict[str, Any]]) -> int:
                     item["backdrop"],
                     item["status"],
                     item["listed_at"],
-                    now,
+                    seen_at,
+                    seen_at,
                     item["raw_json"],
                 )
                 for item in normalized
@@ -154,8 +196,18 @@ def save_items(items: list[dict[str, Any]]) -> int:
 
 
 def refresh_market() -> int:
-    items = fetch_portal_items()
-    return save_items(items)
+    return save_items(fetch_portal_items())
+
+
+def row_fresh_dt(row: sqlite3.Row) -> datetime | None:
+    return parse_dt(row["listed_at"]) or parse_dt(row["first_seen_at"]) or parse_dt(row["seen_at"])
+
+
+def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    fresh_dt = row_fresh_dt(row)
+    item["fresh_at"] = fresh_dt.isoformat() if fresh_dt else item.get("seen_at")
+    return item
 
 
 def monitor_market() -> None:
@@ -167,6 +219,68 @@ def monitor_market() -> None:
         except Exception as exc:
             print(f"Portal Market refresh failed: {exc}")
         time.sleep(POLL_SECONDS)
+
+
+def exact_match(item: dict[str, Any], name: str, model: str, backdrop: str) -> bool:
+    return (
+        item.get("name") == name
+        and item.get("model") == model
+        and item.get("backdrop") == backdrop
+    )
+
+
+def fetch_sales(name: str, model: str, backdrop: str, limit: int = 10) -> list[dict[str, Any]]:
+    sales: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    for offset in range(0, 100, 50):
+        try:
+            raw_items = fetch_portal_items(limit=50, status="sold", sort="-sold_at", offset=offset, timeout=8)
+        except Exception as exc:
+            print(f"Sales fetch failed: {exc}")
+            break
+
+        if not raw_items:
+            break
+
+        for raw in raw_items:
+            item = normalize_item(raw)
+            if item["id"] in seen_ids:
+                continue
+            if exact_match(item, name, model, backdrop):
+                seen_ids.add(item["id"])
+                sales.append(item)
+                if len(sales) >= limit:
+                    return sales
+
+    return sales
+
+
+def format_analysis_message(name: str, model: str, backdrop: str, sales: list[dict[str, Any]]) -> str:
+    title = f"Анализ: {name}\nМодель: {model}\nФон: {backdrop}"
+    if not sales:
+        return f"{title}\n\nПоследние продажи не найдены."
+
+    lines = [title, "", f"Последние {len(sales)} продаж:"]
+    for index, sale in enumerate(sales, start=1):
+        when = sale.get("sold_at") or sale.get("listed_at") or "время неизвестно"
+        lines.append(f"{index}. {sale['price']} TON | {when}")
+    return "\n".join(lines)
+
+
+def send_bot_message(text: str) -> bool:
+    if not BOT_TOKEN or not BOT_CHAT_ID:
+        return False
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": BOT_CHAT_ID, "text": text}).encode("utf-8")
+    try:
+        request = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(request, timeout=10):
+            return True
+    except Exception as exc:
+        print(f"Telegram send failed: {exc}")
+        return False
 
 
 @app.on_event("startup")
@@ -187,53 +301,74 @@ def health() -> dict[str, str]:
 
 @app.post("/api/refresh")
 def manual_refresh() -> dict[str, Any]:
-    count = refresh_market()
-    return {"ok": True, "count": count}
+    return {"ok": True, "count": refresh_market()}
 
 
 @app.get("/api/gifts")
-def get_gifts(q: str = "", limit: int = Query(200, ge=1, le=500)) -> list[dict[str, Any]]:
-    search = f"%{q.strip().lower()}%"
-    with db_connect() as conn:
-        if q.strip():
-            rows = conn.execute(
-                """
-                SELECT id, name, price, tg_id, photo_url, model, backdrop, status, listed_at, seen_at
-                FROM items_v3
-                WHERE lower(name || ' ' || model || ' ' || backdrop) LIKE ?
-                ORDER BY seen_at DESC, price ASC
-                LIMIT ?
-                """,
-                (search, limit),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT id, name, price, tg_id, photo_url, model, backdrop, status, listed_at, seen_at
-                FROM items_v3
-                ORDER BY seen_at DESC, price ASC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+def get_gifts(
+    q: str = "",
+    min_price: float = Query(0, ge=0),
+    minutes: int = Query(DEFAULT_WINDOW_MINUTES, ge=1, le=1440),
+    limit: int = Query(500, ge=1, le=1000),
+) -> list[dict[str, Any]]:
+    search = q.strip().lower()
+    cutoff = now_utc() - timedelta(minutes=minutes)
 
-    if not rows:
+    with db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, name, price, tg_id, photo_url, model, backdrop, status,
+                   listed_at, seen_at, first_seen_at
+            FROM items_v3
+            WHERE price >= ?
+            ORDER BY seen_at DESC
+            LIMIT ?
+            """,
+            (min_price, max(limit * 4, 100)),
+        ).fetchall()
+
+    fresh_items = []
+    for row in rows:
+        item = row_to_dict(row)
+        fresh_dt = parse_dt(item.get("fresh_at"))
+        haystack = f"{item['name']} {item['model']} {item['backdrop']}".lower()
+        if fresh_dt and fresh_dt < cutoff:
+            continue
+        if search and search not in haystack:
+            continue
+        fresh_items.append(item)
+
+    if not fresh_items:
         try:
             refresh_market()
-            with db_connect() as conn:
-                rows = conn.execute(
-                    """
-                    SELECT id, name, price, tg_id, photo_url, model, backdrop, status, listed_at, seen_at
-                    FROM items_v3
-                    ORDER BY seen_at DESC, price ASC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                ).fetchall()
         except Exception as exc:
             print(f"Lazy refresh failed: {exc}")
 
-    return [dict(row) for row in rows]
+    fresh_items.sort(key=lambda item: item.get("fresh_at") or item.get("seen_at") or "", reverse=True)
+    return fresh_items[:limit]
+
+
+@app.post("/api/analyze")
+def analyze_gift(payload: dict[str, Any]) -> dict[str, Any]:
+    name = str(payload.get("name") or "").strip()
+    model = str(payload.get("model") or "").strip()
+    backdrop = str(payload.get("backdrop") or "").strip()
+    limit = int(payload.get("limit") or 10)
+    limit = max(1, min(limit, 50))
+
+    sales = fetch_sales(name, model, backdrop, limit=limit)
+    message = format_analysis_message(name, model, backdrop, sales)
+    sent_to_bot = send_bot_message(message)
+
+    return {
+        "ok": True,
+        "name": name,
+        "model": model,
+        "backdrop": backdrop,
+        "sales": sales,
+        "message": message,
+        "sent_to_bot": sent_to_bot,
+    }
 
 
 if __name__ == "__main__":
