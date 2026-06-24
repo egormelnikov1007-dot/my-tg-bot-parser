@@ -12,7 +12,8 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 def init_db():
     conn = sqlite3.connect('portal_market.db')
     cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS items 
+    # Создаем новую таблицу items_v2
+    cursor.execute('''CREATE TABLE IF NOT EXISTS items_v2 
                       (id TEXT PRIMARY KEY, name TEXT, price REAL, tg_id TEXT, image_url TEXT)''')
     conn.commit()
     conn.close()
@@ -24,7 +25,8 @@ def get_gifts():
     conn = sqlite3.connect('portal_market.db')
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    cursor.execute("SELECT name, price, tg_id, image_url FROM items ORDER BY price ASC")
+    # Читаем из новой таблицы
+    cursor.execute("SELECT name, price, tg_id, image_url FROM items_v2 ORDER BY price ASC")
     return [dict(row) for row in cursor.fetchall()]
 
 async def monitor_market():
@@ -38,7 +40,7 @@ async def monitor_market():
                 item_id = str(item['id'])
                 # Берем точное поле из логов
                 image_url = item.get('photo_url', '') 
-                cursor.execute("INSERT OR REPLACE INTO items VALUES (?, ?, ?, ?, ?)", 
+                cursor.execute("INSERT OR REPLACE INTO items_v2 VALUES (?, ?, ?, ?, ?)", 
                                (item_id, item.get('name'), float(item.get('price')), item.get('tg_id'), image_url))
             conn.commit()
             conn.close()
