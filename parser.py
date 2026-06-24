@@ -30,7 +30,6 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
-# ИНИЦИАЛИЗАЦИЯ БАЗЫ С НОВЫМ ПОЛЕМ image_url
 conn_init = sqlite3.connect('portal_market.db')
 cursor_init = conn_init.cursor()
 cursor_init.execute('''
@@ -49,7 +48,6 @@ conn_init.close()
 def get_gifts():
     conn = get_db_connection()
     cursor = conn.cursor()
-    # Забираем image_url для приложения
     cursor.execute("SELECT name, price, tg_id, image_url FROM items ORDER BY price ASC")
     rows = cursor.fetchall()
     conn.close()
@@ -77,13 +75,18 @@ async def monitor_market():
             cursor = conn.cursor()
             
             for item in data['results']:
+                # ЭТА СТРОКА ВЫВЕДЕТ ВСЕ ДАННЫЕ В ЛОГИ RENDER
+                print(f"DEBUG_DATA: {item}") 
+                
                 try:
                     item_id = str(item['id'])
-                    name = item.get('name', 'Unknown Gift')
-                    price = float(item['price'])
+                    name = item.get('name', 'Unknown')
+                    price = float(item.get('price', 0))
                     tg_id = item.get('tg_id', '')
-                    # БЕРЕМ ССЫЛКУ НА КАРТИНКУ ИЗ API
-                    image_url = item.get('image', '') 
+                    
+                    # Пытаемся достать картинку из любого похожего поля
+                    # (Если в логах увидишь другое имя поля, мы его потом поменяем)
+                    image_url = item.get('image', '') or item.get('media', '') or item.get('image_url', '')
                     
                     cursor.execute("SELECT price FROM items WHERE id = ?", (item_id,))
                     row = cursor.fetchone()
@@ -91,13 +94,11 @@ async def monitor_market():
                     if row is None:
                         cursor.execute("INSERT INTO items VALUES (?, ?, ?, ?, ?)", 
                                        (item_id, name, price, tg_id, image_url))
-                        conn.commit()
-                        await bot.send_message(CHAT_ID, f"🚨 Новый: {name} ({price} TON)")
                     else:
                         cursor.execute("UPDATE items SET price = ?, image_url = ? WHERE id = ?", 
                                        (price, image_url, item_id))
-                        conn.commit()
-                except Exception as e:
+                    conn.commit()
+                except Exception:
                     continue
             conn.close()
         await asyncio.sleep(DELAY)
