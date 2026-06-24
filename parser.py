@@ -3,6 +3,7 @@ import os
 import sqlite3
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -377,6 +378,50 @@ def debug_auth_check() -> dict[str, Any]:
         }
     except Exception as exc:
         return {"ok": False, "auth_present": True, "error": str(exc)}
+
+
+@app.get("/api/debug/probe")
+def debug_probe() -> dict[str, Any]:
+    """Пробует разные комбинации параметров к Portal API и показывает, что принимается."""
+    if not PORTAL_AUTH:
+        return {"ok": False, "error": "PORTAL_AUTH не задан"}
+
+    attempts = [
+        {"status": "listed", "sort": "-listed_at", "limit": 2, "offset": 0},
+        {"status": "sold", "sort": "-sold_at", "limit": 2, "offset": 0},
+        {"status": "sold", "sort": "latest", "limit": 2, "offset": 0},
+        {"sort": "latest", "activityType": "sale", "limit": 2, "offset": 0},
+        {"sort": "latest", "limit": 2, "offset": 0},
+        {"sort": "price_desc", "limit": 2, "offset": 0},
+    ]
+
+    results = []
+    for params in attempts:
+        entry: dict[str, Any] = {"params": params}
+        try:
+            url = f"{PORTAL_API_URL}?{urllib.parse.urlencode(params)}"
+            headers = {"User-Agent": "PortalGiftScanner/1.0", "Authorization": PORTAL_AUTH}
+            request = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(request, timeout=10) as response:
+                body = json.loads(response.read().decode("utf-8"))
+                results_list = body.get("results") or body.get("nfts") or []
+                entry["ok"] = True
+                entry["count"] = len(results_list) if isinstance(results_list, list) else None
+                entry["top_level_keys"] = list(body.keys())
+                entry["sample"] = results_list[:1] if isinstance(results_list, list) else body
+        except urllib.error.HTTPError as exc:
+            entry["ok"] = False
+            entry["http_status"] = exc.code
+            try:
+                entry["error_body"] = exc.read().decode("utf-8")[:500]
+            except Exception:
+                entry["error_body"] = "<не удалось прочитать тело ошибки>"
+        except Exception as exc:
+            entry["ok"] = False
+            entry["error"] = str(exc)
+        results.append(entry)
+
+    return {"ok": True, "attempts": results}
 
 
 @app.post("/api/refresh")
